@@ -1,0 +1,703 @@
+```{r}
+## Подключение необходимых библиотек
+
+library(telegram.bot)
+library(purrr)
+library(tidyr)
+library(stringr)
+library(tidyverse)
+library(tidytext)
+library(openxlsx)
+library(dplyr)
+library(cluster)  
+library(factoextra)
+library(reshape2)
+library(textclean)
+library(splitstackshape)
+library(tm)
+library(SnowballC)
+```
+
+
+```{r}
+## Загрузка данных
+print("Загрузка данных...")
+# Загрузка таблиц с играми для сценария 1
+# Датафрейм с играми для сценария 1 (ВСТАВИТЬ ПУТЬ)
+data=read_csv("games_clean.csv")
+
+# Чистим датафрейм с играми от повторов:
+# Достаём URL игры (game[1]), затем сплитим по / и берём id игры (5й элемент). Фильтруем датафрейм по уникальным значениям id
+data$game_id <- "0"
+
+for (i in 1:nrow(data)){
+  game_url <- as.character(data[i, 1])
+  game_id <- strsplit(game_url, "/")[[1]][5]
+  data[i, 6] <- game_id
+}
+
+data <- data[!duplicated(data[,c('game_id')]),]
+
+# Датафрейм с играми для сценария 2 (ВСТАВИТЬ ПУТЬ)
+games_clean_ver1 <- read.csv('search.csv')
+
+# Чистим датафрейм с играми от повторов:
+# Достаём URL игры (game[1]), затем сплитим по / и берём id игры (5й элемент). Фильтруем датафрейм по уникальным значениям id
+games_clean_ver1$game_id <- "0"
+
+for (i in 1:nrow(games_clean_ver1)){
+  game_url <- as.character(games_clean_ver1[i, 1])
+  game_id <- strsplit(game_url, "/")[[1]][5]
+  games_clean_ver1[i, 4] <- game_id
+}
+
+games_clean_ver1 <- games_clean_ver1[!duplicated(games_clean_ver1[,c('game_id')]),]
+games_clean_ver1 <- games_clean_ver1 %>% select(-"game_id")
+
+# Загружаем список выбранных игр, которые пользователь будет оценивать в сценарии 1 (ВСТАВИТЬ ПУТЬ)
+chosen_games=read_csv("chosen_games.csv")
+
+# Создаем длинный формат
+chosen_games_tidy=chosen_games %>% select(games_in_data,popular_tags) %>%  unnest_tokens(tag, popular_tags, token="regex",pattern=",")
+
+# Загружаем широкий формат с 1, если тэг у игры есть и 0 если тэга нет
+# Его мы потом и используем для рекомендации (ВСТАВИТЬ ПУТЬ)
+recommend_wide=read_csv("recommend_wide.csv")
+
+# Датафрейм с играми, которые будут оцениваться (оценки сюда не записываются)
+ratings=data.frame(games_in_data=chosen_games$games_in_data,rating=NA,row.names = chosen_games$games_to_write)
+
+feedbacks <- read.csv2("feedbacks.csv")
+
+print("Данные загружены")
+```
+
+
+```{r}
+## Создание таблиц, которыми активно пользуется бот
+print("Создание таблиц...")
+
+### СОЗДАНИЕ ТАБЛИЦ, ЕСЛИ ОНИ ВДРУ СЛЕТЯТ
+# Создание таблицы пользователей. В ней у каждого пользователя 
+# ids <- c("777")
+# states <- c("logged")
+# game_number <- c(0)
+# users <- data.frame(id = ids, state = states, game_number = game_number)
+
+# Создание таблицы оценок пользователей
+# games <- c("Dota 2")
+# marks <- c(0)
+# user_ids <- c("777")
+# game_marks <- data.frame(user_id = user_ids, game = games, mark = marks)
+
+# Создание таблицы с рекомендациями
+# games <- c("Dota 2")
+# sum_points <- c(0)
+# user_ids <- c("777")
+# urls <- c("https://google.com")
+# recommendations <- data.frame(name = games, sum_points = sum_points, url = urls, user_id = user_ids)
+
+# Создание таблицы с фидбеком
+# ids <- c("777")
+# usernames <- c("AAA")
+# texts <- c("Test")
+# feedbacks <- data.frame(user_id = ids, username = usernames, text = texts)
+
+# write.csv2(feedbacks, "./feedbacks.csv", row.names=FALSE)
+# write.csv2(users, "./users.csv", row.names=FALSE)
+# write.csv2(game_marks, "./game_marks.csv", row.names=FALSE)
+# write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+
+###
+
+# Создание таблицы пользователей. В ней у каждого пользователя 
+users <- read.csv2("users.csv")
+
+# Создание таблицы оценок пользователей
+game_marks <- read.csv2("game_marks.csv")
+
+# Создание таблицы с рекомендациями
+recommendations <- read.csv2("recommendations.csv")
+
+print("Таблицы созданы")
+
+```
+
+```{r}
+
+## Вспомогательные функции, которыми активно пользуется бот
+print("Загрузка функций...")
+
+
+# Функция создания пользователя. В качестве аргумента принимает id нового пользователя.
+create_user <- function(user_id) {
+  
+  # Создаём объект пользователя
+  user <- c(user_id, "new", 1)
+  names(user) <- c("id", "state", "game_number")
+  
+  # Если такой пользователь уже есть, ставим в его состояние new и обнуляем число сделанных оценок. Если такого пользователя нет - добавляем его в датафрейм с пользователями users
+  if(any(users == user_id)) {
+    users$state[users$id == user_id] <<- "new"
+    users$game_number[users$id == user_id] <<- 1
+  } else {
+    users <<- rbind(users, user)
+  }
+  write.csv2(users, "./users.csv", row.names=FALSE)
+}
+
+# Функция изменения состояния пользователя. В качестве аргумента принимает id пользователя и новое состояние (если что, состояние это просто строка. Оно обрабатывается при получении ботом сообщения)
+change_user_state <- function(user_id, new_state) {
+  
+  # Проверяем, существует ли пользователь с таким id. Если нет - создаём с помощью create_user.
+  if(!any(users == user_id)) {
+    create_user(user_id)
+  }
+  
+  # Записываем новое состояние пользователя
+  users$state[users$id == user_id] <<- new_state
+  write.csv2(users, "./users.csv", row.names=FALSE)
+
+}
+
+# Функция добавления оценки пользователя. В качестве аргумента принимает id пользователя, номер игры, которую оценивает пользователь и число, которое является оценкой. Если пользователь уже оценивал игру с таким номером - оценка перезаписывается.
+add_mark <- function(user_id, game_number, mark) {
+  
+  # Проверяем, существует ли пользователь с таким id. Если нет - создаём с помощью create_user. Устанавливаем состояние этого пользователя в "marking" (т.е. он сейчас оценивает игры)
+  if(!any(users == user_id)) {
+    create_user(user_id)
+    change_user_state(user_id, "marking")
+  }
+  # Если номер игры выходит за пределы списка игр - берём первую игру из списка.
+  if(game_number > nrow(ratings)) {
+    game_number = 1
+  }
+  # Если этот пользователь уже оценивал игру с таким номером - оценка перезаписывается. Если нет - записываем новую оценку в датафрейм. На самом деле эта часть не нужна, поскольку перед новыми рекомендациями мы чистим все оценки этого пользователя. На всякий случай не удалять.
+    # Создаём вектор с пользователем, названием игры и оценкой, чтобы внести его в таблицу с оценками.
+    mark_row = c(user_id, ratings[game_number, 1], mark)
+    names(mark_row) <- c("user_id", "game", "mark")
+    # Добавляем созданную оценку в датафрейм со всеми оценками
+    game_marks <<- rbind(game_marks, mark_row) 
+    write.csv2(game_marks, "./game_marks.csv", row.names=FALSE)
+}
+
+
+# Функция отправки рекомендаций. На вход принимает объекты bot, update (из сообщения пользователя) и таблицу с рекомендациями.
+send_table <- function( bot, update, table ) {
+  message <- "Ваши рекомендации:\n\n"
+  for(i in 1:(nrow(table))){
+    message <- paste0(message, i, ". ")
+    message <- paste0(message, as.character(table[i, 1]), "\n", as.character(table[i, 2]), "\n\n")
+  }
+  bot$sendMessage(update$message$chat_id, text = message)
+}
+```
+
+```{r}
+
+## Работа рекомендательной системы (СЦЕНАРИЙ 1)
+
+# Создание рекомендаций. Единственный входной аргумент - id пользователя. Записывает рекомендации для пользователя в датафрейм recommendations.
+create_recommendations <- function(user_id) {
+
+  # Достаём все оценки пользователя
+  user_marks <- game_marks[game_marks$user_id == user_id, ]
+
+  ## КУСОК КОДА РОМЫ C НЕБОЛЬШИМИ ДОПОЛНЕНИЯМИ.
+  
+  # создаю датафрейм со всеми тэгами каждой игры и для каждого тэга присваиваю вес исходя из оценки 
+  # потом делаю групбай по тэгам и перемножаю значение - так мы получим итоговый вес тэга в рекомендации   
+  multiplicator = merge(chosen_games_tidy, user_marks, by.x="games_in_data", by.y="game")
+  multiplicator$coef = ifelse(multiplicator$mark == 1, 0.5, ifelse(multiplicator$mark==2, 0.75, ifelse(multiplicator$mark==4, 1.5, ifelse(multiplicator$mark==5, 2, 1))))
+  final_coef = multiplicator %>% group_by(tag) %>% summarise(all_coef = prod(coef))
+  final_coef = final_coef %>% column_to_rownames(var = "tag")
+  
+  # recommend_wide общий для всех пользователей, но из-за того, что мы используем его внутри функции без перезаписи с помощью <<-, он остаётся прежним для других пользователей, т.к. не меняется вне функции.
+  for (i in final_coef %>% row.names()){
+    recommend_wide[i] <- recommend_wide[i] * final_coef[i, "all_coef"]
+  }
+  
+  # Тут мы все построчно суммируем и сортируем
+  recommend_wide$sum_points = recommend_wide %>% select(-name) %>% rowSums()
+  recommend_df = recommend_wide %>% select(name, sum_points) %>% merge(data %>% select(name, url), all.x = T, all.y = F, by="name")
+  
+  # Теоретически, нам нужны не все игр (топ 5, чтобы показать их сразу и ещё несколько, чтобы их можно было заменить). В датафрейм записываем топ 70.
+  recommend_df = recommend_df %>% arrange(-sum_points)
+  user_recommendations <- recommend_df %>% head(70)
+  user_recommendations$user_id <- user_id
+  
+  ## КОНЕЦ КУСКА КОДА РОМЫ
+  
+  # Записываем рекомендации пользователя в датафрейм со всеми рекомендациями
+  recommendations <<- rbind(recommendations, user_recommendations)
+
+  write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+}
+
+```
+
+```{r}
+second_scenarion_recommendations <- function(user_id, message_text) {
+  
+  queryTerm <- tolower(message_text)
+  # НАЧАЛО КОДА ЮРЫ
+  total <- as.character(queryTerm)
+  
+  name <- 'input'
+  
+  url <- 'no'
+  
+  user_inputs <- cbind(name, total, url)
+  
+  clu <- rbind(games_clean_ver1, user_inputs)
+  
+  clustering2 <- cSplit_e(clu, 'total', sep = " ", mode = 'binary', type = "character",
+  drop = TRUE, fixed = TRUE, fill = 0)
+  
+  k3 <- kmeans(clustering2[,3:ncol(clustering2)], centers = 3, nstart = 25)
+  
+  clu$clusters = factor(k3$cluster)
+  
+  assigned_cluster <- clu[which(clu$name == 'input'),ncol(clu)]
+  
+  engine <- filter(clu, clusters == assigned_cluster & name != 'input')
+  
+  engine_names <- as.data.frame(engine[,2])
+  
+  colnames(engine_names)[1] <- 'name'
+  
+  for_search <- left_join(engine_names, clu, on = "name")
+  
+  docList <- as.list(for_search$total)
+  
+  N.docs <- length(docList)
+  
+  for_search$ID <- seq.int(nrow(for_search))
+  
+  my.docs <- VectorSource(c(docList, queryTerm))
+  
+  my.corpus <- VCorpus(my.docs) %>% 
+               tm_map(stemDocument) %>%
+               tm_map(removeNumbers) %>% 
+               tm_map(content_transformer(tolower)) %>% 
+               tm_map(removeWords,stopwords("en")) %>%
+               tm_map(stripWhitespace)
+  
+  term.doc.matrix.stm <- TermDocumentMatrix(my.corpus,
+                                            control=list(
+                                              weighting=function(x) weightSMART(x,spec="ltc"),
+                                              wordLengths=c(1,Inf)))
+  
+  term.doc.matrix <- tidy(term.doc.matrix.stm) %>% 
+                     group_by(document) %>% 
+                     mutate(vtrLen=sqrt(sum(count^2))) %>% 
+                     mutate(count=count/vtrLen) %>% 
+                     ungroup() %>% 
+                     select(term:count)
+  
+  docMatrix <- term.doc.matrix %>% 
+               mutate(document=as.numeric(document)) %>% 
+               filter(document<N.docs+1)
+  
+  qryMatrix <- term.doc.matrix %>% 
+               mutate(document=as.numeric(document)) %>% 
+               filter(document>=N.docs+1)
+  
+  searchRes <<- docMatrix %>% 
+               inner_join(qryMatrix,by=c("term"="term"),
+                          suffix=c(".doc",".query")) %>% 
+               mutate(termScore=round(count.doc*count.query,4)) %>% 
+               group_by(document.query,document.doc) %>% 
+               summarise(Score=sum(termScore)) %>% 
+               filter(row_number(desc(Score)) <= 70) %>% 
+               arrange(desc(Score)) %>% 
+               left_join(for_search,by=c("document.doc"="ID")) %>% 
+               ungroup() %>% 
+               select(name, url) %>% 
+               data.frame()
+  
+  # КОНЕЦ КОДА ЮРЫ
+  
+  user_recommendations <- as.data.frame(searchRes$name)
+  user_recommendations$sum_points <- 0
+  user_recommendations$url <- searchRes$url
+  user_recommendations$user_id <- user_id
+  colnames(user_recommendations)[1] <- "name"
+  
+  recommendations <<- rbind(recommendations, user_recommendations)
+  write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+} 
+
+```
+
+```{r}
+## Обработка сообщений пользователя.
+#  Аргументы bot и update в каждой функции необходимы для корректной работы бота. bot - объект бота, update - объект сообщения, которое бот получает.
+#  Ниже эти функцию передаются handler-ам, которые вызывают функции, когда бот получает сообщение.
+
+# Обработка команды /scen1 (начало первого сценария)
+begin_scen_1 <- function(bot, update) {
+
+  # Id пользователя, который прислал команду 
+  user_id <- update$message$from$id
+  
+  # Создаём нового пользователя
+  create_user(user_id)
+
+  # Имя пользователя, который прислал сообщение
+  username <- update$message$from$first_name
+
+  # Отправляем приветсвенное сообщение
+  bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Добро пожаловать в рекомендательную систему, ", username , "!\n\nСейчас мы предложим тебе оценить до 35 игр по шкале от 1 до 5.\n\nОценка 1 - игра совсем не нравится.\nОценка 2 - игра скорее не нравится.\nОценка 3 - не знаю, как оценить игру или безразличен к ней.\nОценка 4 - игра скорее нравится.\nОценка 5 - игра очень нравится.\n\nОстановить процесс оценивания игр можно командой stop. Помни, что чем больше игр ты оценишь, тем точнее будут рекомендации."),
+                  parse_mode = "Markdown")
+  
+  # Ставим состоянию пользователя значнеие "marking". Т.е. в данный момент пользователь проводит оценивание игр.
+  change_user_state(user_id, "marking")
+
+  # Удаляем все предыдущие оценки и рекомендации этого пользователя
+  game_marks <<- game_marks[game_marks$user_id != user_id, ]
+  recommendations <<- recommendations[recommendations$user_id != user_id, ]
+  write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+
+  # Устанавливаем кол-во оцененных игр в 1
+  users$game_number[users$id == user_id] <<- 1
+  write.csv2(users, "./users.csv", row.names=FALSE)
+
+  # Отправляем сообщение с просьбой оценить первую игру
+  bot$sendMessage(update$message$chat_id, 
+                    text = paste0("Оцените от 1 до 5 игру ", rownames(ratings)[1]),
+                    parse_mode = "Markdown")
+}
+
+# Обработка команды /scen2 (начало второго сценария)
+begin_scen_2 <- function(bot, update) {
+
+  # Id пользователя, который прислал команду 
+  user_id <- update$message$from$id
+  
+  # Создаём нового пользователя
+  create_user(user_id)
+  
+  # Имя пользователя, который прислал сообщение
+  username <- update$message$from$first_name
+
+  # Отправляем приветсвенное сообщение
+  bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Добро пожаловать в рекомендательную систему, ", username , "!\nВведите слова, с которыми в ассоциируете свою игру."),
+                  parse_mode = "Markdown")
+  
+  # Удаляем все предыдущие рекомендации этого пользователя
+  recommendations <<- recommendations[recommendations$user_id != user_id, ]
+  write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+  
+  # Ставим состоянию пользователя значнеие "marking". Т.е. в данный момент пользователь проводит оценивание игр.
+  change_user_state(user_id, "second_scenario")
+}
+
+# Обработка ЛЮБОГО ввода, кроме команд /scen1, /scen2 и /feedback. Функция активно использует состояние пользователя.
+input_processing <- function(bot, update) {
+  
+  # Id пользователя, который прислал сообщение
+  user_id <- update$message$from$id
+  
+  # Если такого пользователя нет - создаём его
+  if(!any(users == user_id)) {
+    create_user(user_id)
+  }
+  
+  # Состояние пользователя, который прислал сообщение
+  user_state <- users$state[users$id == user_id]
+  
+  # Если пользователь новый (имеет состояние "new") высылаем ему инструкцию.
+  if(user_state == "new") {
+    username <- update$message$from$first_name
+
+    bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Добро пожаловать, ", username, "!
+Тебя приветствует бот по рекомендациям игр STEAM.
+
+Я помогу тебе подобрать желаемую игру из магазина игр STEAM на основе твоих предпочтений и желаний.
+
+
+У меня есть 4 основные команды:
+/scen1 - Запуск первого сценария
+/scen2 - Запуск второго сценария
+/feedback - Возможность оставить отзыв
+
+Что такое сценарии и чем они отличаются?
+
+Сценарии - это различные способы рекомендации игр, которые зависят от предпочтений пользователя.
+Если ты не знаешь конкретного описания геймплея/жанра/даты релиза и тд. желаемой игры, а просто хочешь найти что-то новое, то переходи к первому сценарию. Там, на основе оценивания предложенной мной подборки игр, ты сможешь найти что-то новое и интересное для себя.
+Если ты уже знаешь примерное описание, жанр и другие параметры игры, то смело переходи ко второму сценарию, где я помогу тебе найти игру по твоим пожеланиям.
+
+Рекомендации к использованию:
+Чем больше ты укажешь “теговых” характеристик игр, тем лучше будет рекомендация. Таких как “shooter”, “FPS”, “2d”, “strategy”, “indie” и так далее. 
+Например, если написать “i want to play a game similar to minecraft” - система не сможет определить конкретные характеристики игры, так как (1) предлагаемой игры для сравнения может не быть в steam, (2)  ты не указал конкретные характеристики игры. 
+Хорошими примерами могут быть такие запросы, как: “‘i want to play an action game with great soundtrack” или “i would like to play some atmospheric 4x strategy game”."),
+                  parse_mode = "Markdown")
+  
+  }
+  
+  # Обработка состояния, в котором пользователь оценивает игры (СЦЕНАРИЙ 1). Если пользователь оценивает игры (имеет состояние "marking") смотрим, что он написал. Если оценку игры - записываем его оценку в датафрейм с оценками (функция add_mark). Если stop - переводим пользователя в состояние "recommendation".
+  if(user_state == "marking") {
+    
+    # Достём текст сообщения пользователя, удаляем из него whitespaces и приводим его в lowercase
+    message_text <- gsub("[[:space:]]", "", update$message$text, fixed = TRUE)
+    message_text <- tolower(message_text)
+    
+    # Если пользователь написал stop - переводим пользователя в состояние "recommendation_first_scenario".
+    if(message_text == "stop"){
+      
+      # Переводим пользователя в состояние "recommendation_first_scenario"
+      change_user_state(user_id, "recommendation_first_scenario")
+      user_state <- users$state[users$id == user_id]
+
+    } else {
+      
+      # Если пользователь ввёл число (т.е. оценку игры) рассматриваем её корректность, затем добавляем оценку в датафрейм с оценками пользователей. Иначе высылаем сообщение о том, что он ввёл некорректные данные.
+      if(!is.na(as.integer(message_text))){
+        
+        # Преобразуем ответ пользователя в число
+        user_mark <- as.integer(message_text)
+        
+        # Если оценка корректная (число от 1 до 5) записываем её в датафрейм с оценками пользователей с помощью функции add_mark. Затем записываем в таблицу users информацию о том, что пользователь перешёл к оцениваю следующей игры (столбец game_number). Если оценка некорректная сообщаем пользователю о том, что он ввёл некорректную оценку.
+        if(user_mark <= 5 && user_mark >= 1) {
+          
+          # Достаём номер игры, которую сейчас оценивает пользователь из таблицы users.
+          game_number <- as.integer(users$game_number[users$id == user_id])
+          
+          # Добавляем оценку в датафрейм с оценками
+          add_mark(user_id, game_number, user_mark)
+          
+          # Отмечаем, что пользователь перешёл к оцениванию следующей игры
+          game_number = game_number + 1
+          users$game_number[users$id == user_id] <<- game_number
+          
+          # Если счётчик больше кол-ва игр, которые можно оценить - сообщаем пользователю об этом и переводим его в состояние "recommendation". Если пользователь ещё не оценил все игры - отправляем ему сообщение с просьбой оценить следующую игру.
+          if(game_number > nrow(ratings)) {
+            change_user_state(user_id, "recommendation_first_scenario")
+            user_state <- users$state[users$id == user_id]
+            bot$sendMessage(update$message$chat_id, 
+                    text = "Вы оценили все игры!",
+                    parse_mode = "Markdown")
+          } else {
+            bot$sendMessage(update$message$chat_id, 
+                    text = paste0("Оцените от 1 до 5 игру ", rownames(ratings)[game_number]),
+                    parse_mode = "Markdown")
+          }
+        } else {
+          bot$sendMessage(update$message$chat_id, 
+                    text = "Введите число от 1 до 5 в качестве оценки игры. Если хотите закончить оценивание игр введите слово stop.",
+                    parse_mode = "Markdown")
+        }
+      } else {
+        bot$sendMessage(update$message$chat_id, 
+                    text = "Введите число от 1 до 5 в качестве оценки игры. Если хотите закончить оценивание игр введите слово stop.",
+                    parse_mode = "Markdown")
+      }
+    }
+  }
+  
+  # Обработка состояния пользователя, в котором он вводит слова для рекомендаций (СЦЕНАРИЙ 2). Принимается любой ввод, кроме пустого. После считывания ввода пользователя, пользователь переходит в состояние  "recommendation_second_scenario"
+  if(user_state == "second_scenario") {
+    # Достаём текст сообщения
+    message_text <- update$message$text
+    # Удаляем пробелы в начале и в конце сообщения
+    message_text <- trimws(message_text, which = "b")
+    if(message_text == "") {
+      bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Описание игры не должно быть пустым! Пожалуйста, повторите ввод."),
+                  parse_mode = "Markdown")
+    } else {
+      change_user_state(user_id, "recommendation_second_scenario")
+      user_state <- users$state[users$id == user_id]
+    }
+  }
+  
+  # Если пользователь получает рекомендации по ПЕРВОМУ сценарию (имеет состояние "recommendation_first_scenario") С помощью рекомендательной системы по оценкам пользователя формируется топ 70 игр, которые ему рекомендуются. Эти игры записываются в датафрейм recommendations и отправляются сообщением пользователю.
+  if(user_state == "recommendation_first_scenario") {
+    # Создаём рекомендации
+    create_recommendations(user_id)
+    # Получаем рекомедации пользователя после их создания
+    user_recommendations <- recommendations[recommendations$user_id == user_id, ] %>% head(5) %>% select("name", "url")
+    # Отправляем их с помощью функции, которая отправляет таблички
+    send_table(bot, update, user_recommendations)
+    
+    bot$sendMessage(update$message$chat_id, 
+                    text = "Введите через пробел номера рекомендаций, которые хотите заменить. Если вас устраивают рекомендации - напишите слово stop.",
+                    parse_mode = "Markdown")
+    
+    # Меняем статус пользователя на "change_recommendation". Но при этом не меняем его на текущем этапе, поскольку если пользователь ввёл слово "stop", то этап с изменением рекомендаций пропустится.
+    change_user_state(user_id, "change_recommendation")
+  }
+  
+  # Если пользователь получает рекомендации по ВТОРОМУ сценарию (имеет состояние "recommendation_second_scenario") С помощью рекомендательной системы по описанию пользователя формируется топ 70 игр, которые ему рекомендуются. Эти игры записываются в датафрейм recommendations и отправляются сообщением пользователю.
+  if(user_state == "recommendation_second_scenario") {
+    # Достаём текст сообщения
+    message_text <- update$message$text
+    # Удаляем пробелы в начале и в конце сообщения
+    message_text <- trimws(message_text, which = "b")
+    # Создание рекомендаций идёт долго, поэтому отправляем пользователю сообщение с предупреждением
+    bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Создание рекомендаций по описанию занимает некоторое время. Пожалуйста, подождите..."),
+                  parse_mode = "Markdown")
+    # Создаём рекомендации
+    second_scenarion_recommendations(user_id, message_text)
+    # Получаем рекомедации пользователя после их создания
+    user_recommendations <- recommendations[recommendations$user_id == user_id, ] %>% head(5) %>% select("name", "url")
+    
+    # Меняем статус пользователя на "end"
+    change_user_state(user_id, "end")
+    user_state <- users$state[users$id == user_id]
+  }
+  
+  # Если пользователь заменяет рекомендации (имеет состояние "change_recommendation") читаем его ввод. Это должны быть числа от 1 до 5 через пробел.
+  if(user_state == "change_recommendation") {
+    message_text <- update$message$text
+    message_text <- tolower(message_text)
+    
+    # Если пользователь написал stop - переводим пользователя в состояние "end". Иначе проверяем ввод на корректность.
+    if(message_text == "stop"){
+      change_user_state(user_id, "end")
+      user_state <- users$state[users$id == user_id]
+    } else {
+      message_splitted <- strsplit(message_text, " ")[[1]]
+      # Флаг указывает на то, является ли ввод пользователя некорректным
+      error_message <- FALSE
+      for(i in 1:length(message_splitted)) {
+        el <- message_splitted[i]
+        # Если хотя бы один из элементов не число - ввод является некорректным
+        if(is.na(as.integer(el))) {
+          error_message <- TRUE
+        }
+      }
+      # Если ввод является некорректным - выводим ошибку. Иначе убираем из списка рекомендаций пользователя рекомендации с номерами, которые ввёл пользователь.
+      if(error_message) {
+        bot$sendMessage(update$message$chat_id, 
+                      text = "Номера должны быть от 1 до 5 и введены через пробел!\nЕсли вас устраивают рекомендации - напишите stop.",
+                      parse_mode = "Markdown")
+      } else {
+        # Необходимо хранить номера элементов, которые мы собираемся удалить, чтобы случайно не удалить их дважды
+        remove <- c()
+
+        for(i in 1:length(message_splitted)) {
+          num <- as.integer(message_splitted[i])
+          # Если ещё не добавили номер удаляемого элемента - добавляем. Также проверяем, находится ли он в промежутке от 1 до 5
+          if(!( num %in% remove ) && num >= 1 && num <= 5){
+            remove <- append(remove, num)
+          }
+        }
+        
+        # Чтобы удалить необходимые записи делим recommendations на две части. Часть, которая не принадлежит текущему пользователю не трогаем. Из части, которая принадлежит текущему пользователю удаляем элементы, согласно вектору remove, который формируется выше
+        recommendations_changed <- recommendations[recommendations$user_id == user_id, ]
+        recommendations_changed <- recommendations_changed[-remove, ]
+        recommendations_second_part <- recommendations[recommendations$user_id != user_id, ]
+        recommendations <<- rbind(recommendations_changed, recommendations_second_part)
+        write.csv2(recommendations, "./recommendations.csv", row.names=FALSE)
+
+        # Получаем изменённые рекомеднации
+        user_recommendations <- recommendations[recommendations$user_id == user_id, ] %>% head(5) %>% select("name", "url")
+        
+        # Если рекомендаций больше 1 - отправляем их пользователю. Если нет - выводим сообщение о том, что рекомендаций больше нет.
+        if(nrow(user_recommendations > 1)) { 
+          send_table(bot, update, user_recommendations)
+          bot$sendMessage(update$message$chat_id, 
+                      text = "Введите через пробел номера рекомендаций, которые хотите заменить. Если вас устраивают рекомендации - напишите слово stop.",
+                      parse_mode = "Markdown")
+        } else {
+          change_user_state(user_id, "end")
+          user_state <- users$state[users$id == user_id]
+        }
+      }
+    }
+  }
+  
+  # Конец работы рекомендательной системы
+  if(user_state == "end") {
+    user_recommendations <- recommendations[recommendations$user_id == user_id, ] %>% head(5) %>% select("name", "url")
+    
+    # Если рекомендаций больше 1 - отправляем их пользователю. Если нет - выводим сообщение о том, что рекомендаций больше нет.
+    if(nrow(user_recommendations > 1)) { 
+      send_table(bot, update, user_recommendations)
+      bot$sendMessage(update$message$chat_id, 
+                    text = "Если хотите заново получить рекомендации, введите команду /scen1 или /scen2. Чтобы оставить отзыв введите /feedback",
+                    parse_mode = "Markdown")
+    } else {
+      bot$sendMessage(update$message$chat_id, 
+                    text = "Кажется, рекомендации для вас закончились! Чтобы получить новые рекомендации, введите /scen1 или /scen2. Чтобы оставить отзыв введите /feedback",
+                    parse_mode = "Markdown")
+    }
+  }
+  
+  # Если пользователь находится в состоянии написания отзыва, ожидаем от него любого текста и записываем его в датафрейм. Затем сохраняем датафрейм в файл.
+  if(user_state == "feedback") {
+     message_text <- update$message$text
+     username <- update$message$from$first_name
+     bot$sendMessage(update$message$chat_id, 
+                    text = "Благодарим за предоставленный отзыв!",
+                    parse_mode = "Markdown")
+     feedback_row = c(user_id, username, message_text)
+     names(feedback_row) <- c("user_id", "username", "text")
+     # Добавляем созданную оценку в датафрейм со всеми оценками
+     feedbacks <<- rbind(feedbacks, feedback_row)
+     change_user_state(user_id, "new")
+     write.csv2(feedbacks, "./feedbacks.csv", row.names=FALSE)
+  }
+}
+
+```
+
+```{r}
+# Функция, обрабатывающая команду /feedback, которая позволяет пользователю оставить обратную связь. Сообщение пользователя записывается в отдельный датафрейм, который сохраняется в файл. 
+make_feedback <- function(bot, update) {
+
+  # Id пользователя, который прислал команду 
+  user_id <- update$message$from$id
+  
+  # Создаём нового пользователя
+  create_user(user_id)
+  
+  # Имя пользователя, который прислал сообщение
+  username <- update$message$from$first_name
+
+  bot$sendMessage(update$message$chat_id, 
+                  text = paste0("Напишите текст отзыва"),
+                  parse_mode = "Markdown")
+  
+  # Ставим состоянию пользователя значнеие "feedback". Т.е. в данный момент пользователь пишит отзыв.
+  change_user_state(user_id, "feedback")
+
+}
+
+print("Функции загружены")
+
+```
+
+```{r}
+
+## Создание самого бота
+print("Запуск бота")
+# Токен ботаЫ
+token <- "1898663693:AAEkps0cXtsObQIeLhtRPOpYFdbckX8p-YQ"
+
+# Создаём handler-ы
+# Тут передаются функции, которые вызываются при получении бота тех или иных сообщений
+# CommandHandler обрабатывает команду /scen1
+scen_1_handler <- CommandHandler('scen1', begin_scen_1)
+# CommandHandler обрабатывает команду /scen2
+scen_2_handler <- CommandHandler('scen2', begin_scen_2)
+# CommandHandler обрабатывает команду /feedback
+feedback_handler <- CommandHandler('feedback', make_feedback)
+# MessageHandler обрабатывает все прочие сообщения, которые приходят боту
+input_processing_handler <- MessageHandler(input_processing)
+
+# Updater - объект, отвечающий за все сообщения, которые принимает бот
+updater <- Updater(token)
+# Добавляем handler-ы к updater-у
+updater <- updater + scen_1_handler + scen_2_handler + feedback_handler + input_processing_handler
+
+# Запускаем бота
+updater$start_polling()
+
+```
